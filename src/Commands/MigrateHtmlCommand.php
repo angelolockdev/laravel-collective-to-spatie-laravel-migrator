@@ -1,7 +1,13 @@
 <?php
 
-namespace Fddo\LaravelHtmlMigrator\Commands;
+nnamespace Fddo\LaravelHtmlMigrator\Commands;
 
+use Fddo\LaravelHtmlMigrator\Converters\CheckboxRadioConverter;
+use Fddo\LaravelHtmlMigrator\Converters\InputConverter;
+use Fddo\LaravelHtmlMigrator\Converters\LabelButtonConverter;
+use Fddo\LaravelHtmlMigrator\Converters\ModelTokenConverter;
+use Fddo\LaravelHtmlMigrator\Converters\OpenCloseConverter;
+use Fddo\LaravelHtmlMigrator\Converters\SelectConverter;
 use Illuminate\Console\Command;
 use Illuminate\Filesystem\Filesystem;
 use RecursiveIteratorIterator;
@@ -15,6 +21,15 @@ class MigrateHtmlCommand extends Command
     protected $files;
     protected $ambiguousLog = [];
     protected $changed = [];
+
+    protected $converters = [
+        OpenCloseConverter::class,
+        InputConverter::class,
+        LabelButtonConverter::class,
+        CheckboxRadioConverter::class,
+        SelectConverter::class,
+        ModelTokenConverter::class,
+    ];
 
     public function __construct(Filesystem $files)
     {
@@ -43,16 +58,18 @@ class MigrateHtmlCommand extends Command
             return 0;
         }
 
+        $converters = array_map(function ($class) {
+            return new $class();
+        }, $this->converters);
+
         foreach ($bladeFiles as $file) {
             $orig = $this->files->get($file);
             $content = $orig;
 
-            $content = $this->convertOpenClose($content, $file);
-            $content = $this->convertInputs($content, $file);
-            $content = $this->convertLabelsButtons($content, $file);
-            $content = $this->convertCheckboxRadio($content, $file);
-            $content = $this->convertSelects($content, $file);
-            $content = $this->convertModelToken($content, $file);
+            foreach ($converters as $converter) {
+                $content = $converter->convert($content, $file);
+                $this->ambiguousLog = array_merge($this->ambiguousLog, $converter->getAmbiguousLogs());
+            }
 
             if ($content !== $orig) {
                 $this->changed[$file] = ['before' => $orig, 'after' => $content];
@@ -102,349 +119,6 @@ class MigrateHtmlCommand extends Command
             if (substr($path, -10) === '.blade.php') $files[] = $path;
         }
         return $files;
-    }
-
-    private function logAmbiguous($file, $lineOrOffset, $snippet, $reason)
-    {
-        $this->ambiguousLog[] = ['file' => $file, 'pos' => $lineOrOffset, 'snippet' => substr($snippet, 0, 200), 'reason' => $reason];
-    }
-
-    private function extractParenthesized($content, $startParen)
-    {
-        $len = strlen($content);
-        if ($content[$startParen] !== '(') return null;
-        $depth = 0;
-        $inString = false; $stringChar = null; $escaped = false;
-        for ($i = $startParen; $i < $len; $i++) {
-            $ch = $content[$i];
-            if ($inString) {
-                if ($escaped) { $escaped = false; }
-                elseif ($ch === "\\") { $escaped = true; }
-                elseif ($ch === $stringChar) { $inString = false; $stringChar = null; }
-                continue;
-            } else {
-                if ($ch === '\'' || $ch === '"') { $inString = true; $stringChar = $ch; continue; }
-                if ($ch === '(') $depth++;
-                elseif ($ch === ')') {
-                    $depth--;
-                    if ($depth === 0) {
-                        $between = substr($content, $startParen + 1, $i - $startParen - 1);
-                        return [$between, $i];
-                    }
-                }
-            }
-        }
-        return null;
-    }
-
-    private function splitTopLevelArgs($s)
-    {
-        $len = strlen($s);
-        $args = []; $buf = ''; $depth = 0;
-        $inString = false; $stringChar = null; $escaped = false;
-        for ($i=0;$i<$len;$i++) {
-            $ch = $s[$i];
-            if ($inString) {
-                $buf .= $ch;
-                if ($escaped) { $escaped = false; } elseif ($ch === "\\") { $escaped = true; } elseif ($ch === $stringChar) { $inString = false; $stringChar = null; }
-                continue;
-            } else {
-                if ($ch === '\'' || $ch === '"') { $inString = true; $stringChar = $ch; $buf .= $ch; continue; }
-                if ($ch === '[' || $ch === '(' || $ch === '{') { $depth++; $buf .= $ch; continue; }
-                if ($ch === ']' || $ch === ')' || $ch === '}') { $depth--; $buf .= $ch; continue; }
-                if ($ch === ',' && $depth === 0) { $args[] = trim($buf); $buf = ''; continue; }
-                $buf .= $ch;
-            }
-        }
-        if (strlen(trim($buf))>0) $args[] = trim($buf);
-        return $args;
-    }
-
-    private function tryEvalArrayLiteral($s)
-    {
-        if (stripos($s, 'function') !== false || stripos($s, '<?') !== false) return null;
-        $code = "<?php\nreturn " . $s . ";\n";
-        try {
-            return (function() use ($code) { return eval($code); })();
-        } catch (\Throwable $e) {
-            return null;
-        } catch (\Exception $e) {
-            return null;
-        }
-    }
-
-    private function convertOpenClose($content, $file)
-    {
-        $content = preg_replace('/\bForm::close\s*\(\s*\)\s*;?/i', 'html()->form()->close();', $content);
-        $offset = 0;
-        while (($pos = stripos($content, 'Form::open', $offset)) !== false) {
-            $openParen = strpos($content, '(', $pos);
-            if ($openParen === false) { $offset = $pos + 9; continue; }
-            $ex = $this->extractParenthesized($content, $openParen);
-            if ($ex === null) { $this->logAmbiguous($file, $pos, substr($content, $pos, 80), "unbalanced parentheses in Form::open"); $offset = $pos + 9; continue; }
-            list($between, $endPos) = $ex;
-            $replacement = $this->buildFormOpenReplacement($between, $file, $pos);
-            if ($replacement === null) { $offset = $endPos + 1; continue; }
-            $after = substr($content, $endPos + 1, 2);
-            $semi = ''; if (preg_match('/^\s*;/', $after)) $semi = ';';
-            $content = substr($content, 0, $pos) . $replacement . $semi . substr($content, $endPos + 1 + strlen($semi));
-            $offset = $pos + strlen($replacement);
-        }
-        return $content;
-    }
-
-    private function buildFormOpenReplacement($argString, $file, $pos)
-    {
-        $trim = trim($argString);
-        if ($trim === '') return "html()->form()->open()";
-        $args = $this->splitTopLevelArgs($trim);
-        if (count($args) === 1 && !preg_match('/^\s*\[/', $trim)) {
-            $action = $args[0];
-            return "html()->form('POST', {$action})->open()";
-        }
-        if (preg_match('/^\s*\[/', $trim)) {
-            $parsed = $this->tryEvalArrayLiteral($trim);
-            if (is_array($parsed)) {
-                $method = strtoupper($parsed['method'] ?? ($parsed['type'] ?? 'POST'));
-                $actionExpr = 'null';
-                if (array_key_exists('route', $parsed) && $parsed['route'] !== null) {
-                    if (is_string($parsed['route'])) $actionExpr = "route('" . addslashes($parsed['route']) . "')";
-                    elseif (is_array($parsed['route']) && isset($parsed['route'][0]) && is_string($parsed['route'][0])) {
-                        $name = array_shift($parsed['route']);
-                        $argCodes = [];
-                        foreach ($parsed['route'] as $a) $argCodes[] = var_export($a, true);
-                        $actionExpr = "route('" . addslashes($name) . "'" . (empty($argCodes) ? '' : (", [" . implode(', ', $argCodes) . "]")) . ")";
-                    } else $actionExpr = 'null';
-                } elseif (array_key_exists('action', $parsed) && is_string($parsed['action'])) {
-                    $actionExpr = "'" . addslashes($parsed['action']) . "'";
-                } elseif (array_key_exists('url', $parsed) && is_string($parsed['url'])) {
-                    $actionExpr = "'" . addslashes($parsed['url']) . "'";
-                }
-
-                $attrs = [];
-                if (isset($parsed['accept-charset'])) $attrs['accept-charset'] = $parsed['accept-charset'];
-                elseif (isset($parsed['accept_charset'])) $attrs['accept-charset'] = $parsed['accept_charset'];
-                if (array_key_exists('novalidate', $parsed)) {
-                    $nv = $parsed['novalidate'];
-                    if ($nv === true || $nv === 'novalidate' || $nv === 1) $attrs['novalidate'] = 'novalidate';
-                    elseif (is_string($nv)) $attrs['novalidate'] = $nv;
-                }
-                if (isset($parsed['files']) && ($parsed['files'] === true || $parsed['files'] === 'true')) $attrs['enctype'] = 'multipart/form-data';
-                foreach (['class','id','style','role','accept'] as $k) if (isset($parsed[$k])) $attrs[$k] = $parsed[$k];
-
-                $attrCode = $this->buildAttributesCode($attrs);
-                if ($actionExpr === 'null' && $attrCode === '[]' && $method === 'POST') return "html()->form()->open()";
-                return "html()->form('{$method}', {$actionExpr})->attributes({$attrCode})->open()";
-            } else {
-                $this->logAmbiguous($file, $pos, $argString, "complex array literal (skipped)");
-                return null;
-            }
-        }
-        $this->logAmbiguous($file, $pos, $argString, "unknown Form::open args (skipped)");
-        return null;
-    }
-
-    private function convertInputs($content, $file)
-    {
-        $fns = ['text','email','password','file','hidden'];
-        foreach ($fns as $fn) {
-            $offset = 0;
-            while (($pos = stripos($content, "Form::{$fn}(", $offset)) !== false) {
-                $open = strpos($content, '(', $pos);
-                if ($open === false) { $offset = $pos + 6; continue; }
-                $ex = $this->extractParenthesized($content, $open);
-                if ($ex === null) { $this->logAmbiguous($file, $pos, substr($content,$pos,80), "unbalanced parenthesis in Form::{$fn}"); $offset = $pos + 6; continue; }
-                list($between, $endPos) = $ex;
-                $args = $this->splitTopLevelArgs($between);
-                $name = $args[0] ?? "''";
-                $value = $args[1] ?? null;
-                $attrs = $args[2] ?? null;
-
-                $rep = null;
-                if (in_array($fn, ['password','file'])) {
-                    $rep = "html()->{$fn}({$name})";
-                    if ($attrs !== null) $rep .= "->attributes({$attrs})";
-                } elseif ($fn === 'hidden') {
-                    $rep = "html()->hidden({$name})";
-                    if ($value !== null) $rep .= "->value({$value})";
-                } else {
-                    $rep = "html()->{$fn}({$name})";
-                    if ($value !== null && trim($value) !== '') $rep .= "->value({$value})";
-                    if ($attrs !== null) $rep .= "->attributes({$attrs})";
-                }
-
-                $after = substr($content, $endPos + 1, 2); $semi = ''; if (preg_match('/^\s*;/', $after)) $semi = ';';
-                $content = substr($content, 0, $pos) . $rep . $semi . substr($content, $endPos + 1 + strlen($semi));
-                $offset = $pos + strlen($rep);
-            }
-        }
-        return $content;
-    }
-
-    private function convertLabelsButtons($content, $file)
-    {
-        $offset = 0;
-        while (($pos = stripos($content, "Form::label(", $offset)) !== false) {
-            $open = strpos($content, '(', $pos);
-            $ex = $this->extractParenthesized($content, $open);
-            if ($ex === null) { $this->logAmbiguous($file,$pos,substr($content,$pos,80),"unbalanced label()"); $offset=$pos+8; continue; }
-            list($between,$endPos) = $ex;
-            $args = $this->splitTopLevelArgs($between);
-            $name = $args[0] ?? "''";
-            $text = $args[1] ?? "null";
-            $attrs = $args[2] ?? null;
-            $rep = "html()->label()->for({$name})";
-            if ($text !== "null") $rep .= "->text({$text})";
-            if ($attrs !== null) $rep .= "->attributes({$attrs})";
-            $after = substr($content, $endPos + 1, 2); $semi=''; if (preg_match('/^\s*;/', $after)) $semi=';';
-            $content = substr($content,0,$pos) . $rep . $semi . substr($content,$endPos+1+strlen($semi));
-            $offset = $pos + strlen($rep);
-        }
-
-        foreach (['submit','button'] as $fn) {
-            $offset = 0;
-            while (($pos = stripos($content, "Form::{$fn}(", $offset)) !== false) {
-                $open = strpos($content, '(', $pos);
-                $ex = $this->extractParenthesized($content, $open);
-                if ($ex === null) { $this->logAmbiguous($file,$pos,substr($content,$pos,80),"unbalanced {$fn}()"); $offset=$pos+6; continue; }
-                list($between,$endPos) = $ex;
-                $args = $this->splitTopLevelArgs($between);
-                $value = $args[0] ?? "'Submit'";
-                $attrs = $args[1] ?? null;
-                $rep = "html()->button({$value})->type('submit')";
-                if ($attrs !== null) $rep .= "->attributes({$attrs})";
-                $after = substr($content, $endPos + 1, 2); $semi=''; if (preg_match('/^\s*;/', $after)) $semi=';';
-                $content = substr($content,0,$pos) . $rep . $semi . substr($content,$endPos+1+strlen($semi));
-                $offset = $pos + strlen($rep);
-            }
-        }
-        return $content;
-    }
-
-    private function convertCheckboxRadio($content, $file)
-    {
-        foreach (['checkbox','radio'] as $fn) {
-            $offset = 0;
-            while (($pos = stripos($content, "Form::{$fn}(", $offset)) !== false) {
-                $open = strpos($content, '(', $pos);
-                $ex = $this->extractParenthesized($content, $open);
-                if ($ex === null) { $this->logAmbiguous($file,$pos,substr($content,$pos,80),"unbalanced {$fn}()"); $offset=$pos+6; continue; }
-                list($between,$endPos) = $ex;
-                $args = $this->splitTopLevelArgs($between);
-                $name = $args[0] ?? "''";
-                $value = $args[1] ?? "null";
-                $checked = $args[2] ?? "null";
-                $attrs = $args[3] ?? null;
-
-                if ($fn === 'checkbox') {
-                    $checkedExpr = ($checked !== "null") ? $checked : 'false';
-                    $valExpr = ($value !== "null") ? $value : "'1'";
-                    $rep = "html()->checkbox({$name}, {$checkedExpr}, {$valExpr})";
-                } else {
-                    $checkedExpr = ($checked !== "null") ? $checked : 'false';
-                    $valExpr = ($value !== "null") ? $value : "null";
-                    $rep = "html()->radio({$name}, {$checkedExpr}, {$valExpr})";
-                }
-                if ($attrs !== null) $rep .= "->attributes({$attrs})";
-                $after = substr($content, $endPos + 1, 2); $semi=''; if (preg_match('/^\s*;/', $after)) $semi=';';
-                $content = substr($content,0,$pos) . $rep . $semi . substr($content,$endPos+1+strlen($semi));
-                $offset = $pos + strlen($rep);
-            }
-        }
-        return $content;
-    }
-
-    private function convertSelects($content, $file)
-    {
-        $offset = 0;
-        while (($pos = stripos($content, "Form::select(", $offset)) !== false) {
-            $open = strpos($content, '(', $pos);
-            $ex = $this->extractParenthesized($content, $open);
-            if ($ex === null) { $this->logAmbiguous($file,$pos,substr($content,$pos,80),"unbalanced select()"); $offset=$pos+12; continue; }
-            list($between,$endPos) = $ex;
-            $args = $this->splitTopLevelArgs($between);
-            $name = $args[0] ?? "''";
-            $options = $args[1] ?? "[]";
-            $selected = $args[2] ?? "null";
-            $attrs = $args[3] ?? null;
-
-            $childrenCode = null;
-            if (preg_match('/^\s*\[/', $options)) {
-                $arr = $this->tryEvalArrayLiteral($options);
-                if (is_array($arr)) {
-                    $parts = [];
-                    foreach ($arr as $val => $lab) {
-                        $valCode = var_export($val, true);
-                        $labCode = var_export($lab, true);
-                        $opt = "html()->option({$labCode}, {$valCode})";
-                        if ($selected !== "null" && (trim($selected, "'\"") === (string)$val)) {
-                            $opt .= "->attributes(['selected' => 'selected'])";
-                        }
-                        $parts[] = $opt;
-                    }
-                    $childrenCode = '[' . implode(', ', $parts) . ']';
-                } else {
-                    $this->logAmbiguous($file,$pos,$options,"complex options array (skipped inline) - using collect() fallback");
-                    $childrenCode = "collect({$options})->map(function(\$label,\$value){ return html()->option(\$label, \$value); })->all()";
-                }
-            } else {
-                $childrenCode = "collect({$options})->map(function(\$label,\$value){ return html()->option(\$label, \$value); })->all()";
-            }
-
-            $rep = "html()->select({$name})->children({$childrenCode})";
-            if ($attrs !== null) $rep .= "->attributes({$attrs})";
-            $after = substr($content, $endPos + 1, 2); $semi=''; if (preg_match('/^\s*;/', $after)) $semi=';';
-            $content = substr($content,0,$pos) . $rep . $semi . substr($content,$endPos+1+strlen($semi));
-            $offset = $pos + strlen($rep);
-        }
-        return $content;
-    }
-
-    private function convertModelToken($content, $file)
-    {
-        $offset = 0;
-        while (($pos = stripos($content, "Form::model(", $offset)) !== false) {
-            $open = strpos($content, '(', $pos);
-            $ex = $this->extractParenthesized($content, $open);
-            if ($ex === null) { $this->logAmbiguous($file,$pos,substr($content,$pos,80),"unbalanced model()"); $offset=$pos+11; continue; }
-            list($between,$endPos) = $ex;
-            $args = $this->splitTopLevelArgs($between);
-            $model = $args[0] ?? '$model';
-            $options = $args[1] ?? '[]';
-            $formOpen = null;
-            if (trim($options) === '[]') $formOpen = "html()->form()->open()";
-            else {
-                if (preg_match('/^\s*\[/', $options)) {
-                    $formOpen = $this->buildFormOpenReplacement($options, $file, $pos);
-                    if ($formOpen === null) { $this->logAmbiguous($file,$pos,$options,"complex model() options - skipped form open"); $offset=$endPos+1; continue; }
-                } else {
-                    $this->logAmbiguous($file,$pos,$options,"dynamic model() options (skipped)");
-                    $offset = $endPos + 1;
-                    continue;
-                }
-            }
-            $rep = "html()->model({$model}); " . $formOpen;
-            $after = substr($content, $endPos + 1, 2); $semi=''; if (preg_match('/^\s*;/', $after)) $semi=';';
-            $content = substr($content,0,$pos) . $rep . $semi . substr($content,$endPos+1+strlen($semi));
-            $offset = $pos + strlen($rep);
-        }
-
-        $content = preg_replace('/\bForm::token\s*\(\s*\)\s*;?/i', 'csrf_field();', $content);
-
-        return $content;
-    }
-
-    private function buildAttributesCode($attrs)
-    {
-        if (empty($attrs)) return '[]';
-        $parts = [];
-        foreach ($attrs as $k => $v) {
-            if (is_string($v)) $parts[] = "'" . addslashes($k) . "' => '" . addslashes($v) . "'";
-            elseif (is_bool($v)) $parts[] = "'" . addslashes($k) . "' => " . ($v ? 'true' : 'false');
-            elseif (is_null($v)) $parts[] = "'" . addslashes($k) . "' => null";
-            else $parts[] = "'" . addslashes($k) . "' => " . var_export($v, true);
-        }
-        return '[' . implode(', ', $parts) . ']';
     }
 
     private function showSnippetDiff($before, $after, $lines = 6)
