@@ -1,0 +1,6 @@
+/vendor/
+/node_modules/
+.env
+.env.backup
+composer.lock
+yarn.lock
