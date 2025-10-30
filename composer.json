@@ -1,6 +1,7 @@
 {
     "name": "angelolockdev/laravel-collective-to-spatie-laravel-migrator",
     "description": "A simple tool to migrate Laravel Collective HTML syntax to Spatie Laravel HTML syntax.",
+    "version": "1.1.0",
     "type": "library",
     "license": "MIT",
     "authors": [
