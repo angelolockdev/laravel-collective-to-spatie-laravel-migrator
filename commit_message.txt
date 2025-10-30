@@ -1,1 +1,1 @@
-Refactor: Separate conversion logic into dedicated classes
+feat: Implement rollback and focus features
